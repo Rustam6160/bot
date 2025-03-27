@@ -1435,24 +1435,24 @@ class BotRunner:
 async def main():
     # Конфигурация для первого бота
     config1 = {
-        'bot_name': 'Bot1',
-        'api_id': 27245693,
-        'api_hash': 'c7197f5d1a9bb46b03cc6981fa120b2e',
-        'bot_token': '7773769474:AAED9waVV3s8quGbjwl8DP_YyuTtvx6qznk',
+        'bot_name': 'Botkg',
+        'api_id': 25188844,
+        'api_hash': '7c8965cac5439d5f88c3ab6ac29f394b',
+        'bot_token': '7526490262:AAFPGLhrcScaRxhPMsPWDUfCXKJdhtAWiuY',
         'proxy': proxy,
         'db_file': 'mailing1.db',
-        'owner_id': 1771561807
+        'owner_id': 6351807167
     }
 
     # Конфигурация для второго бота
     config2 = {
-        'bot_name': 'Bot2',
-        'api_id': 24494246,
-        'api_hash': '0b656ca02eff5e1022533f16a1c29e52',
-        'bot_token': '7306593002:AAFA540655TxgCELgLvrtFtgmELwZKkT5-g',
+        'bot_name': 'Botru',
+        'api_id': 12914043,
+        'api_hash': '7bf1cb9eaedae46821cc23154646bc95',
+        'bot_token': '7464740988:AAFBYMjyIGMAxfd3JQUYC95BM8NcXUfTwzU',
         'proxy': proxy2,
         'db_file': 'mailing2.db',
-        'owner_id': 1771561807
+        'owner_id': 7111113380
     }
 
     # Запускаем ботов параллельно
