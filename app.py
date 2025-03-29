@@ -833,7 +833,7 @@ class BotRunner:
                     caption = response[:MAX_CAPTION_LENGTH]
                     await event.client.send_file(event.chat_id, photo_path, caption=caption)
                     remaining_text = response[MAX_CAPTION_LENGTH:]
-                    for chunk in split_text(remaining_text):
+                    for chunk in self.split_text(remaining_text):
                         await event.respond(chunk)
                 else:
                     await event.client.send_file(event.chat_id, photo_path, caption=response)
@@ -989,6 +989,7 @@ class BotRunner:
 
     MAX_CAPTION_LENGTH = 1024  # Лимит для подписи к медиа
     MAX_TEXT_LENGTH = 4096  # Лимит для обычного текстового сообщения
+
 
     def split_text(text, chunk_size=MAX_TEXT_LENGTH):
         """Разбивает текст на части указанного размера."""
