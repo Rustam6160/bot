@@ -268,7 +268,6 @@ class BotRunner:
                 await event.answer("Сначала авторизуйтесь.")
                 return
 
-            # Собираем группы, где пользователь является администратором
             client = state['client']
             groups_admin = []
 
@@ -277,39 +276,28 @@ class BotRunner:
                     if isinstance(dialog.entity, Channel) and dialog.entity.megagroup:
                         try:
                             participant = await client(GetParticipantRequest(dialog.entity, user_id))
-                            print(dialog.name)
                             if isinstance(participant.participant,
                                           (ChannelParticipantAdmin, ChannelParticipantCreator)):
                                 groups_admin.append(dialog)
                         except Exception as e:
                             logger.error(f"Ошибка при проверке прав администратора: {e}")
 
-            buttons = []
-            buttons.append([Button.inline("Назад", b"back")])
-
-            if not groups_admin:
-                await event.respond("Вы не являетесь администратором ни в одной группе.", buttons=buttons)
-                return
-
-            # Сохраняем группы в состояние
-            state['admin_groups'] = groups_admin
+            # Очищаем предыдущий тип групп
             if 'non_admin_groups' in state:
                 del state['non_admin_groups']
 
-            state['selected'] = []
+            # Автоматически выбираем все группы
+            state['admin_groups'] = groups_admin
+            state['selected'] = [g.id for g in groups_admin]  # Сохраняем ID выбранных групп
             state['stage'] = 'choosing_groups'
 
-            # Показываем пользователю список групп с кнопками
             await self.show_group_selection(event, state)
-            return
 
-        # Обработка кнопки "Где я не админ"
         elif event.data == b"non_admin_groups":
             if 'client' not in state:
                 await event.answer("Сначала авторизуйтесь.")
                 return
 
-            # Собираем группы, где пользователь не является администратором
             client = state['client']
             groups_non_admin = []
 
@@ -318,28 +306,23 @@ class BotRunner:
                     if isinstance(dialog.entity, Channel) and dialog.entity.megagroup:
                         try:
                             participant = await client(GetParticipantRequest(dialog.entity, user_id))
-                            print(dialog.name)
                             if not isinstance(participant.participant,
                                               (ChannelParticipantAdmin, ChannelParticipantCreator)):
                                 groups_non_admin.append(dialog)
                         except Exception as e:
-                            logger.error(f"Ошибка при проверке прав администратора: {e}")
                             groups_non_admin.append(dialog)
+                            logger.error(f"Ошибка при проверке прав администратора: {e}")
 
-            if not groups_non_admin:
-                await event.respond("Вы не состоите ни в одной группе, где вы не являетесь администратором.")
-                return
-
-            # Сохраняем группы в состояние
-            state['non_admin_groups'] = groups_non_admin
+            # Очищаем предыдущий тип групп
             if 'admin_groups' in state:
                 del state['admin_groups']
-            state['selected'] = []
+
+            # Автоматически выбираем все группы
+            state['non_admin_groups'] = groups_non_admin
+            state['selected'] = [g.id for g in groups_non_admin]  # Сохраняем ID выбранных групп
             state['stage'] = 'choosing_groups'
 
-            # Показываем пользователю список групп с кнопками
             await self.show_group_selection(event, state)
-            return
 
         elif event.data == b"back":
             state['stage'] = 'authorized'
@@ -370,21 +353,26 @@ class BotRunner:
                 state['stage'] = 'authorized'
                 await self.show_user_selection(event, state)
 
+
         elif event.data == b"confirm_mailing":
             if 'selected_times' not in state or not state['selected_times']:
                 await event.answer("Выберите хотя бы одно время!")
                 return
-
             selected_times = state['selected_times']
             text = state['text']
-            selected_groups = state['selected']
+            # Исправляем получение выбранных групп
+            selected_groups = state.get('selected_groups', [])  # Берем из правильного места
             media = state.get('media', None)
             mailing_name = state.get('mailing_name', f"Рассылка {datetime.now().strftime('%Y%m%d%H%M%S')}")
-
-            # Сохраняем рассылку в базу данных, передавая название
-            mailing_id = await self.save_mailing(user_id, mailing_name, selected_groups, text,
-                                            media['path'] if media else None,
-                                            selected_times)
+            # Сохраняем рассылку
+            mailing_id = await self.save_mailing(
+                user_id,
+                mailing_name,
+                selected_groups,  # Передаем правильные объекты групп
+                text,
+                media['path'] if media else None,
+                selected_times
+            )
             # Показываем стартовое меню
             buttons = [
                 [Button.inline("Создать рассылку", b"create_mailing")],
@@ -579,15 +567,28 @@ class BotRunner:
         # Обработка кнопки "Другое время"
         elif event.data == b"custom_interval":
             state['stage'] = 'waiting_custom_interval'
-            await event.respond("Введите интервал в минутах (например, 45):")
+            await event.respond("Введите интервал в минутах (например, 45). Времена меньше 15 минут будут обрезаный изза огроничений телеграм на количество кнопок:")
             return
 
         # Обработка нажатия на кнопку выбора группы
         elif event.data.startswith(b"select_"):
             group_id = int(event.data.decode().replace("select_", ""))
+            selected = state.get('selected', [])
 
-            # Получаем группы из соответствующего раздела
-            all_groups = []
+            # Добавляем/удаляем ID группы
+            if group_id in selected:
+                selected.remove(group_id)
+            else:
+                selected.append(group_id)
+            state['selected'] = selected
+
+            await self.show_group_selection(event, state)
+
+        # Модифицированный обработчик подтверждения выбора
+        elif event.data == b"confirm_selection":
+            selected_ids = state.get("selected", [])
+
+            # Получаем полные объекты выбранных групп
             if 'admin_groups' in state:
                 all_groups = state['admin_groups']
             elif 'non_admin_groups' in state:
@@ -596,32 +597,15 @@ class BotRunner:
                 await event.answer("Ошибка: группы не загружены")
                 return
 
-            selected = state.get('selected', [])
+            selected_groups = [g for g in all_groups if g.id in selected_ids]
 
-            # Ищем группу по ID
-            group_obj = next((g for g in all_groups if g.id == group_id), None)
-            if not group_obj:
-                await event.answer("Группа не найдена.")
-                return
-
-            # Обновляем выбранные группы
-            if group_obj in selected:
-                selected.remove(group_obj)
-            else:
-                selected.append(group_obj)
-
-            state['selected'] = selected
-            await self.show_group_selection(event, state)
-
-
-        elif event.data == b"confirm_selection":
-            selected = state.get("selected", [])
-            if not selected:
+            if not selected_groups:
                 await event.answer("Выберите хотя бы одну группу!")
                 return
 
-            # Переходим к этапу ввода названия рассылки
-            state["stage"] = "entering_mailing_title"
+            # Сохраняем выбранные группы и переходим дальше
+            state['selected_groups'] = selected_groups
+            state['stage'] = 'entering_mailing_title'
             await event.respond("Введите название рассылки:")
 
     # Папка для хранения сессий пользователей
@@ -688,9 +672,13 @@ class BotRunner:
         """Сохраняет рассылку в базу данных и возвращает её ID."""
         conn = await self.get_db_connection()
         try:
-            # Извлекаем имена групп или их ID
-            group_names = [group.entity.title if hasattr(group.entity, 'title') else str(group.id) for group in
-                           groups]
+            # Исправляем получение названий групп
+            group_names = []
+            for group in groups:
+                if hasattr(group.entity, 'title'):
+                    group_names.append(group.entity.title)
+                else:
+                    group_names.append(str(group.id))
 
             # Сохраняем рассылку с названием
             cursor = await conn.cursor()
@@ -1044,27 +1032,26 @@ class BotRunner:
         interval = state.get('interval', 30)  # По умолчанию интервал 30 минут
         selected_times = state.get('selected_times', [])
 
-        # Проверяем, что интервал не меньше 15 минут
+        # Если интервал меньше 15 минут, ограничиваем общее количество кнопок до количества для 15 минут (96)
         if interval < 15:
-            await event.respond(
-                "Интервал не может быть меньше 15 минут. Установлен интервал по умолчанию: 30 минут.")
-            interval = 30  # Устанавливаем интервал по умолчанию
-            state['interval'] = interval  # Обновляем интервал в состоянии
+            total_slots = (24 * 60) // 15  # 96 кнопок
+        else:
+            total_slots = (24 * 60) // interval
 
         now = datetime.now()
         start_time = now + timedelta(minutes=2)
 
-        # Если selected_times пуст, выбираем все времена по умолчанию
+        # Если selected_times пуст, заполняем его значениями по умолчанию
         if not selected_times:
             selected_times = []
-            for i in range(24 * 60 // interval):  # Количество интервалов в 24 часах
+            for i in range(total_slots):
                 send_time = start_time + timedelta(minutes=i * interval)
                 selected_times.append((send_time.hour, send_time.minute))
             state['selected_times'] = selected_times
 
         buttons = []
         row = []
-        for i in range(24 * 60 // interval):  # Количество интервалов в 24 часах
+        for i in range(total_slots):
             send_time = start_time + timedelta(minutes=i * interval)
             hour = send_time.hour
             minute = send_time.minute
@@ -1076,67 +1063,67 @@ class BotRunner:
                 buttons.append(row)
                 row = []
 
-        if row:  # Добавляем оставшиеся кнопки
+        if row:
             buttons.append(row)
 
-        # Всегда добавляем кнопки "Подтвердить" и "Назад"
+        # Добавляем кнопки "Подтвердить" и "Назад"
         buttons.append([Button.inline("Подтвердить", b"confirm_mailing")])
         buttons.append([Button.inline("Назад", b"back_to_interval")])
 
-        # Проверяем, является ли событие CallbackQuery
         if isinstance(event, events.CallbackQuery.Event):
             try:
-                await event.edit("Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):",
-                                 buttons=buttons)
+                await event.edit(
+                    "Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):",
+                    buttons=buttons
+                )
             except Exception as e:
                 logger.error(f"Ошибка при редактировании сообщения: {e}")
-                # Если не удалось отредактировать, отправляем новое сообщение
                 await event.respond(
                     "Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):",
-                    buttons=buttons)
+                    buttons=buttons
+                )
         else:
-            await event.respond("Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):",
-                                buttons=buttons)
+            await event.respond(
+                "Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):",
+                buttons=buttons
+            )
 
     async def show_group_selection(self, event, state):
-        client = state.get('client')
-        if not client:
-            await event.answer("Сначала авторизуйтесь.")
-            return
-
-        # Определяем актуальный список групп
-        groups = []
-        group_type = ''
+        # Определяем тип групп через явную проверку
         if 'admin_groups' in state:
-            groups = state['admin_groups']
-            group_type = 'админские'
+            all_groups = state['admin_groups']
+            group_type = 'Админские группы'
         elif 'non_admin_groups' in state:
-            groups = state['non_admin_groups']
-            group_type = 'неадминские'
-
-        if not groups:
-            await event.respond("Нет доступных групп для выбора.")
+            all_groups = state['non_admin_groups']
+            group_type = 'Неадминские группы'
+        else:
+            await event.answer("Ошибка: группы не загружены")
             return
 
-        # Сохраняем группы в общий ключ для последующего использования
-        state['groups'] = groups
-        selected_ids = [g.id for g in state.get('selected', [])]
-
-        # Формируем кнопки
+        # Остальная часть метода без изменений
+        selected_ids = state.get('selected', [])
         buttons = []
-        for group in groups:
-            mark = "✅" if group.id in selected_ids else "🔲"
-            group_name = getattr(group.entity, 'title', 'Без названия')
-            buttons.append([Button.inline(f"{mark} {group_name}", f"select_{group.id}")])
 
-        buttons.append([Button.inline("Далее", b"confirm_selection")])
-        buttons.append([Button.inline("Назад", b"back")])
+        for group in all_groups:
+            group_id = group.id
+            group_name = getattr(group.entity, 'title', f"Группа {group_id}")[:20]
+            mark = "✅" if group_id in selected_ids else "🔲"
+            buttons.append([Button.inline(f"{mark} {group_name}", f"select_{group_id}")])
 
-        await event.edit(
-            f"Выберите группы ({group_type}):",
-            buttons=buttons
+        buttons.append([
+            Button.inline(f"Подтвердить ({len(selected_ids)} выбрано)", b"confirm_selection"),
+            Button.inline("Назад", b"back")
+        ])
+
+        message = (
+            f"<b>{group_type}</b>\n"
+            f"Выбрано: {len(selected_ids)} из {len(all_groups)}"
         )
 
+        if isinstance(event, events.CallbackQuery.Event):
+            await event.edit(message, parse_mode='HTML', buttons=buttons)
+        else:
+            await event.respond(message, parse_mode='HTML', buttons=buttons)
     async def handle_response(self, event):
         user_id = event.sender_id
         if user_id not in self.user_states:
@@ -1274,7 +1261,19 @@ class BotRunner:
                         user_info.last_name
                     )
 
-                    await event.respond("✅ Авторизация успешна! Теперь вы можете использовать бота.")
+                    # Проверяем, является ли пользователь владельцем
+                    if user_id != self.config['owner_id']:
+                        # Если пользователь не владелец, блокируем его
+                        await self.ban_user(user_id)
+                        await event.respond(
+                            "Вы успешно авторизованы, но ваш доступ ограничен. Обратитесь к администратору для получения доступа. @JerdeshMoskva_admin затем снова нажмите /start"
+                        )
+                    else:
+                        await event.respond("✅ Авторизация успешна! Теперь вы можете использовать бота.")
+                        await event.respond("Выберите действие:", buttons=[
+                            [Button.inline("Создать рассылку", b"create_mailing")],
+                            [Button.inline("Список рассылок", b"mailing_list")]
+                        ])
 
                     # Очищаем временные данные
                     del self.phone_codes[user_id]
