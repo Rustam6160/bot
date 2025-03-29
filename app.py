@@ -990,9 +990,8 @@ class BotRunner:
     MAX_CAPTION_LENGTH = 1024  # Лимит для подписи к медиа
     MAX_TEXT_LENGTH = 4096  # Лимит для обычного текстового сообщения
 
-
+    @staticmethod
     def split_text(text, chunk_size=MAX_TEXT_LENGTH):
-        """Разбивает текст на части указанного размера."""
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
     async def help_command(self, event):
