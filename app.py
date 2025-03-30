@@ -35,7 +35,6 @@ class BotRunner:
             proxy=config['proxy']
         )
         self.client.parse_mode = 'html'
-        self.client.parse_mode = 'html'
         self.OWNER_ID = config['owner_id']
         self.API_ID = config['api_id']
         self.API_HASH = config['api_hash']
@@ -48,19 +47,23 @@ class BotRunner:
         conn = await aiosqlite.connect(self.config['db_file'])
         try:
             await conn.executescript('''
+                -- Таблица рассылок теперь хранит названия групп и их ID (разделённые запятыми)
                 CREATE TABLE IF NOT EXISTS mailings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
                     name TEXT,
-                    groups TEXT,
+                    group_names TEXT,
+                    group_ids TEXT,
                     message TEXT,
                     photo_path TEXT
                 );
 
+                -- Добавлен флаг is_sent (0 – не отправлено, 1 – отправлено)
                 CREATE TABLE IF NOT EXISTS mailing_times (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     mailing_id INTEGER,
                     send_time TEXT,
+                    is_sent INTEGER DEFAULT 0,
                     FOREIGN KEY(mailing_id) REFERENCES mailings(id)
                 );
 
@@ -82,8 +85,8 @@ class BotRunner:
         conn = await aiosqlite.connect(self.config['db_file'])
         try:
             await conn.execute(
-                "INSERT OR IGNORE INTO users VALUES (NULL, ?, ?, ?, ?, ?, 1)",
-                (user_id, username, first_name, last_name, datetime.now().strftime('%Y-%m-%d %H:%M')))
+                "INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, registration_date, is_active) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, username, first_name, last_name, datetime.now().strftime('%Y-%m-%d %H:%M'), 1))
             await conn.commit()
         finally:
             await conn.close()
@@ -101,6 +104,9 @@ class BotRunner:
         self.client.add_event_handler(self.delete_mailing_handler,
                                       events.CallbackQuery(pattern=r"delete_mailing_(\d+)"))
 
+        # Запускаем фоновую задачу по проверке незавершённых рассылок
+        asyncio.create_task(self.process_pending_mailings())
+
         logger.info(f"Бот {self.config['bot_name']} запущен")
         await self.client.run_until_disconnected()
 
@@ -109,29 +115,21 @@ class BotRunner:
         user_id = event.sender_id
         logger.info(f"{self.config['bot_name']}: User {user_id} started")
 
-
         current_time = datetime.now()
-
-        # Проверяем, авторизован ли пользователь и активен ли его аккаунт
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
             await cursor.execute("SELECT is_active FROM users WHERE user_id = ?", (user_id,))
             user = await cursor.fetchone()
-
-            # Если пользователь найден и он заблокирован
             if user and user[0] == 0:
                 await event.respond("⛔ Ваш доступ заблокирован. Обратитесь к администратору @JerdeshMoskva_admin")
                 return
         finally:
             await conn.close()
 
-        # Проверяем, есть ли уже загруженная сессия в user_states
         if user_id in self.user_states and 'client' in self.user_states[user_id]:
             client = self.user_states[user_id]['client']
-            # Проверяем, авторизован ли клиент
             if await client.is_user_authorized():
-                # Показываем меню без повторной загрузки сессии
                 buttons = [
                     [Button.inline("Создать рассылку", b"create_mailing")],
                     [Button.inline("Список рассылок", b"mailing_list")]
@@ -141,15 +139,9 @@ class BotRunner:
                 await event.respond("Вы уже авторизованы! Выберите действие:", buttons=buttons)
                 return
 
-        # Если сессии нет в user_states, пробуем загрузить
         client = await self.load_user_session(user_id)
         if client:
-            # Сохраняем клиент в user_states
-            self.user_states[user_id] = {
-                'stage': 'authorized',
-                'client': client
-            }
-            # Проверяем, является ли пользователь владельцем
+            self.user_states[user_id] = {'stage': 'authorized', 'client': client}
             if user_id == self.config['owner_id']:
                 buttons = [
                     [Button.inline("Создать рассылку", b"create_mailing")],
@@ -157,7 +149,6 @@ class BotRunner:
                     [Button.inline("Список пользователей", b"user_list")]
                 ]
             else:
-                # Если пользователь не владелец, проверяем, был ли он одобрен
                 conn = await self.get_db_connection()
                 try:
                     cursor = await conn.cursor()
@@ -169,41 +160,31 @@ class BotRunner:
                             [Button.inline("Список рассылок", b"mailing_list")]
                         ]
                     else:
-                        await event.respond(
-                            "⛔ Ваш доступ ограничен. Обратитесь к администратору @JerdeshMoskva_admin")
+                        await event.respond("⛔ Ваш доступ ограничен. Обратитесь к администратору @JerdeshMoskva_admin")
                         return
                 finally:
                     await conn.close()
-
             await event.respond("Вы уже авторизованы! Выберите действие:", buttons=buttons)
             return
 
-        # Инициализируем состояние пользователя
         self.user_states[user_id] = {'stage': 'start'}
         logger.info(f"User {user_id} started the bot.")
-
         conn = None
         try:
             conn = await self.get_db_connection()
             cursor = await conn.cursor()
             await cursor.execute("SELECT id, is_active FROM users WHERE user_id = ?", (user_id,))
             user = await cursor.fetchone()
-
-            # Если пользователь уже зарегистрирован, но не авторизован
             if user:
                 user_db_id, is_active = user
                 if not is_active:
-                    await event.respond(
-                        "⛔ Вы успешно авторизованы, но ваш доступ ограничен. Обратитесь к администратору @JerdeshMoskva_admin, затем снова нажмите /start"
-                    )
+                    await event.respond("⛔ Вы успешно авторизованы, но ваш доступ ограничен. Обратитесь к администратору @JerdeshMoskva_admin, затем снова нажмите /start")
                     return
                 else:
-                    # Если у пользователя есть сохранённая сессия, авторизуем его
                     client = await self.load_user_session(user_id)
                     if client:
                         self.user_states[user_id]['stage'] = 'authorized'
                         self.user_states[user_id]['client'] = client
-
                         buttons = [
                             [Button.inline("Создать рассылку", b"create_mailing")],
                             [Button.inline("Список рассылок", b"mailing_list")]
@@ -213,13 +194,10 @@ class BotRunner:
                         await event.respond("Вы уже авторизованы! Выберите действие:", buttons=buttons)
                         return
                     else:
-                        await event.respond(
-                            "Привет! Для использования бота введите свой номер телефона в формате +XXXXXXXXXXX.")
+                        await event.respond("Привет! Для использования бота введите свой номер телефона в формате +XXXXXXXXXXX.")
                         self.user_states[user_id]['stage'] = 'waiting_phone'
             else:
-                # Если пользователь ещё не зарегистрирован, начинаем процесс авторизации
-                await event.respond(
-                    "Привет! Для использования бота введите свой номер телефона в формате +XXXXXXXXXXX.")
+                await event.respond("Привет! Для использования бота введите свой номер телефона в формате +XXXXXXXXXXX.")
                 self.user_states[user_id]['stage'] = 'waiting_phone'
         except Exception as e:
             logger.error(f"Ошибка при обработке команды /start для пользователя {user_id}: {e}")
@@ -229,7 +207,6 @@ class BotRunner:
                 await conn.close()
 
     async def callback_handler(self, event):
-    # Реализация обработки callback
         user_id = event.sender_id
         if user_id not in self.user_states:
             await event.answer("Сначала введите /start")
@@ -237,7 +214,6 @@ class BotRunner:
 
         state = self.user_states[user_id]
 
-        # Обработка кнопки "Отмена"
         if event.data == b"cancel_user_selection":
             state['stage'] = 'authorized'
             await event.edit("Выбор пользователей отменён.", buttons=[
@@ -248,17 +224,14 @@ class BotRunner:
             return
 
         elif event.data == b"create_mailing":
-            print(state)
             if 'client' not in state:
                 await event.answer("Сначала авторизуйтесь.")
                 return
-
-            # Переходим к этапу выбора типа групп
             state['stage'] = 'choosing_group_type'
             await event.edit("Выберите тип групп:", buttons=[
                 [Button.inline("Где я админ", b"admin_groups")],
                 [Button.inline("Где я не админ", b"non_admin_groups")],
-                ([Button.inline("Назад", b"back")])
+                [Button.inline("Назад", b"back")]
             ])
             return
 
@@ -353,94 +326,40 @@ class BotRunner:
                 state['stage'] = 'authorized'
                 await self.show_user_selection(event, state)
 
-
         elif event.data == b"confirm_mailing":
             if 'selected_times' not in state or not state['selected_times']:
                 await event.answer("Выберите хотя бы одно время!")
                 return
             selected_times = state['selected_times']
             text = state['text']
-            # Исправляем получение выбранных групп
-            selected_groups = state.get('selected_groups', [])  # Берем из правильного места
+            selected_groups = state.get('selected_groups', [])
             media = state.get('media', None)
             mailing_name = state.get('mailing_name', f"Рассылка {datetime.now().strftime('%Y%m%d%H%M%S')}")
-            # Сохраняем рассылку
+            # Сохраняем рассылку в БД (сохраняются group_names и group_ids)
             mailing_id = await self.save_mailing(
                 user_id,
                 mailing_name,
-                selected_groups,  # Передаем правильные объекты групп
+                selected_groups,
                 text,
                 media['path'] if media else None,
                 selected_times
             )
-            # Показываем стартовое меню
             buttons = [
                 [Button.inline("Создать рассылку", b"create_mailing")],
                 [Button.inline("Список рассылок", b"mailing_list")]
             ]
             if user_id == self.config['owner_id']:
                 buttons.append([Button.inline("Список пользователей", b"user_list")])
-
             logger.info(f"Состояние пользователя {user_id}: {state}")
-            await event.respond("Рассылка успешно завершена! Выберите действие:", buttons=buttons)
-
-            # Планируем отправку для каждого выбранного времени
-            for hour, minute in selected_times:
-                send_time = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if send_time < datetime.now():
-                    send_time += timedelta(days=1)
-
-                delay = (send_time - datetime.now()).total_seconds()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-                client = state['client']
-                async with client:
-                    for group in selected_groups:
-                        try:
-                            if media:
-                                if media['type'] == 'photo':
-                                    if len(text) <= MAX_CAPTION_LENGTH:
-                                        logger.info(f"Фото отправлено в группу {group.name} (ID: {group.id})")
-                                        await client.send_file(group.id, media['path'], caption=text)
-                                    else:
-                                        caption = text[:MAX_CAPTION_LENGTH]
-                                        logger.info(
-                                            f"Фото отправлено в группу {group.name} (ID: {group.id}) с обрезанной подписью")
-                                        await client.send_file(group.id, media['path'], caption=caption)
-                                        remaining_text = text[MAX_CAPTION_LENGTH:]
-                                        for chunk in split_text(remaining_text):
-                                            await client.send_message(group.id, chunk)
-                                elif media['type'] == 'video':
-                                    if len(text) <= MAX_CAPTION_LENGTH:
-                                        logger.info(f"Видео отправлено в группу {group.name} (ID: {group.id})")
-                                        await client.send_file(group.id, media['path'], caption=text,
-                                                               supports_streaming=True)
-                                    else:
-                                        caption = text[:MAX_CAPTION_LENGTH]
-                                        logger.info(
-                                            f"Видео отправлено в группу {group.name} (ID: {group.id}) с обрезанной подписью")
-                                        await client.send_file(group.id, media['path'], caption=caption,
-                                                               supports_streaming=True)
-                                        remaining_text = text[MAX_CAPTION_LENGTH:]
-                                        for chunk in split_text(remaining_text):
-                                            await client.send_message(group.id, chunk)
-                            else:
-                                if len(text) <= MAX_TEXT_LENGTH:
-                                    logger.info(f"Сообщение отправлено в группу {group.name} (ID: {group.id})")
-                                    await client.send_message(group.id, text)
-                                else:
-                                    for chunk in split_text(text):
-                                        await client.send_message(group.id, chunk)
-                        except Exception as e:
-                            logger.error(f"Ошибка при отправке в группу {group.name}: {e}")
-
+            await event.respond("Рассылка успешно запланирована! Она будет отправлена в указанные времена.",
+                                buttons=buttons)
+            # Здесь больше не производится непосредственная отправка –
+            # отправка будет выполнена фоновым процессом process_pending_mailings().
             state['stage'] = 'authorized'
             state.pop('selected_times', None)
             state.pop('text', None)
             state.pop('selected', None)
             state.pop('media', None)
-
             return
 
         elif event.data.startswith(b"select_user_"):
@@ -574,21 +493,15 @@ class BotRunner:
         elif event.data.startswith(b"select_"):
             group_id = int(event.data.decode().replace("select_", ""))
             selected = state.get('selected', [])
-
-            # Добавляем/удаляем ID группы
             if group_id in selected:
                 selected.remove(group_id)
             else:
                 selected.append(group_id)
             state['selected'] = selected
-
             await self.show_group_selection(event, state)
 
-        # Модифицированный обработчик подтверждения выбора
         elif event.data == b"confirm_selection":
             selected_ids = state.get("selected", [])
-
-            # Получаем полные объекты выбранных групп
             if 'admin_groups' in state:
                 all_groups = state['admin_groups']
             elif 'non_admin_groups' in state:
@@ -596,14 +509,10 @@ class BotRunner:
             else:
                 await event.answer("Ошибка: группы не загружены")
                 return
-
             selected_groups = [g for g in all_groups if g.id in selected_ids]
-
             if not selected_groups:
                 await event.answer("Выберите хотя бы одну группу!")
                 return
-
-            # Сохраняем выбранные группы и переходим дальше
             state['selected_groups'] = selected_groups
             state['stage'] = 'entering_mailing_title'
             await event.respond("Введите название рассылки:")
@@ -620,7 +529,43 @@ class BotRunner:
         """Возвращает асинхронное соединение с базой данных."""
         return await aiosqlite.connect(self.config['db_file'])
 
-
+    async def send_with_retry(self, client, group, text, media, max_attempts=3):
+        for attempt in range(max_attempts):
+            try:
+                if media:
+                    if media['type'] == 'photo':
+                        if len(text) <= MAX_CAPTION_LENGTH:
+                            await client.send_file(group.id, media['path'], caption=text)
+                        else:
+                            caption = text[:MAX_CAPTION_LENGTH]
+                            await client.send_file(group.id, media['path'], caption=caption)
+                            remaining_text = text[MAX_CAPTION_LENGTH:]
+                            for chunk in self.split_text(remaining_text):
+                                await client.send_message(group.id, chunk)
+                    elif media['type'] == 'video':
+                        if len(text) <= MAX_CAPTION_LENGTH:
+                            await client.send_file(group.id, media['path'], caption=text, supports_streaming=True)
+                        else:
+                            caption = text[:MAX_CAPTION_LENGTH]
+                            await client.send_file(group.id, media['path'], caption=caption, supports_streaming=True)
+                            remaining_text = text[MAX_CAPTION_LENGTH:]
+                            for chunk in self.split_text(remaining_text):
+                                await client.send_message(group.id, chunk)
+                else:
+                    if len(text) <= MAX_TEXT_LENGTH:
+                        await client.send_message(group.id, text)
+                    else:
+                        for chunk in self.split_text(text):
+                            await client.send_message(group.id, chunk)
+                logger.info(f"Сообщение успешно отправлено в группу {group.name} (ID: {group.id})")
+                return True
+            except Exception as e:
+                logger.error(f"Ошибка при отправке в группу {group.name} (попытка {attempt + 1}): {e}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(5)
+                else:
+                    logger.error(f"Не удалось отправить сообщение в группу {group.name} после {max_attempts} попыток")
+                    return False
 
     async def is_owner_in_db(self):
         """Проверяет, есть ли владелец в базе данных."""
@@ -649,7 +594,6 @@ class BotRunner:
         return None
 
     async def ban_user(self, user_id):
-        """Запрещает пользователю доступ к боту."""
         conn = await self.get_db_connection()
         try:
             await conn.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
@@ -659,7 +603,6 @@ class BotRunner:
             await conn.close()
 
     async def unban_user(self, user_id):
-        """Возвращает пользователю доступ к боту."""
         conn = await self.get_db_connection()
         try:
             await conn.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
@@ -669,94 +612,68 @@ class BotRunner:
             await conn.close()
 
     async def save_mailing(self, user_id, mailing_name, groups, message, photo_path, selected_times):
-        """Сохраняет рассылку в базу данных и возвращает её ID."""
         conn = await self.get_db_connection()
         try:
-            # Исправляем получение названий групп
             group_names = []
+            group_ids = []
             for group in groups:
                 if hasattr(group.entity, 'title'):
                     group_names.append(group.entity.title)
                 else:
                     group_names.append(str(group.id))
+                group_ids.append(str(group.id))
+            group_names_str = ', '.join(group_names)
+            group_ids_str = ','.join(group_ids)
 
-            # Сохраняем рассылку с названием
             cursor = await conn.cursor()
             await cursor.execute(
-                "INSERT INTO mailings (user_id, name, groups, message, photo_path) VALUES (?, ?, ?, ?, ?)",
-                (user_id, mailing_name, ', '.join(group_names), message, photo_path)
+                "INSERT INTO mailings (user_id, name, group_names, group_ids, message, photo_path) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, mailing_name, group_names_str, group_ids_str, message, photo_path)
             )
-            mailing_id = cursor.lastrowid  # Получаем ID созданной рассылки
+            mailing_id = cursor.lastrowid
 
-            # Сохраняем времена рассылки
             for hour, minute in selected_times:
                 send_time = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+                # Если время уже прошло – планируем на следующий день
+                if send_time < datetime.now():
+                    send_time += timedelta(days=1)
                 await cursor.execute(
-                    "INSERT INTO mailing_times (mailing_id, send_time) VALUES (?, ?)",
+                    "INSERT INTO mailing_times (mailing_id, send_time, is_sent) VALUES (?, ?, 0)",
                     (mailing_id, send_time.strftime('%Y-%m-%d %H:%M'))
                 )
-
             await conn.commit()
             return mailing_id
         finally:
             await conn.close()
 
     async def fetch_mailings(self, user_id):
-        """Возвращает список рассылок для пользователя."""
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
-            await cursor.execute("SELECT id, groups, message, photo_path FROM mailings WHERE user_id = ?",
-                                 (user_id,))
+            await cursor.execute("SELECT id, group_names, message, photo_path FROM mailings WHERE user_id = ?", (user_id,))
             mailings = await cursor.fetchall()
-
-            # Добавляем времена рассылок
             for mailing in mailings:
                 mailing_id = mailing[0]
                 await cursor.execute("SELECT send_time FROM mailing_times WHERE mailing_id = ?", (mailing_id,))
                 times = await cursor.fetchall()
                 mailing += (times,)
-
             return mailings
         finally:
             await conn.close()
 
     async def show_mailing_list(self, event, user_id):
-        """Отображает список рассылок в виде кнопок и удаляет старые рассылки."""
-        # Обновляем запрос, чтобы получать название (name)
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
-            await cursor.execute("SELECT id, name, groups, message, photo_path FROM mailings WHERE user_id = ?",
-                                 (user_id,))
+            await cursor.execute("SELECT id, name, group_names, message, photo_path FROM mailings WHERE user_id = ?", (user_id,))
             mailings = await cursor.fetchall()
-
-            # Добавляем времена рассылок
             for mailing in mailings:
                 mailing_id = mailing[0]
-                await cursor.execute("SELECT send_time FROM mailing_times WHERE mailing_id = ?", (mailing_id,))
-                times = await cursor.fetchall()
-                mailing += (times,)
-
-            if not mailings:
-                buttons_empty = [[Button.inline("Назад", b"back")]]
-                await event.respond("История рассылок пуста.", buttons=buttons_empty)
-                return
-
-            buttons = []
-            current_time = datetime.now()
-            # Проверка и удаление старых рассылок остаётся без изменений
-            for mailing in mailings:
-                mailing_id = mailing[0]
-                mailing_name = mailing[1]  # Новое поле: название рассылки
-                await cursor.execute(
-                    "SELECT send_time FROM mailing_times WHERE mailing_id = ? ORDER BY send_time ASC LIMIT 1",
-                    (mailing_id,))
+                await cursor.execute("SELECT send_time FROM mailing_times WHERE mailing_id = ? ORDER BY send_time ASC LIMIT 1", (mailing_id,))
                 first_send_time = await cursor.fetchone()
-
                 if first_send_time:
-                    first_send_time = datetime.strptime(first_send_time[0], '%Y-%m-%d %H:%M')
-                    if (current_time - first_send_time).days > 30:
+                    first_send_time_dt = datetime.strptime(first_send_time[0], '%Y-%m-%d %H:%M')
+                    if (datetime.now() - first_send_time_dt).days > 30:
                         photo_path = mailing[4]
                         if photo_path and os.path.exists(photo_path):
                             os.remove(photo_path)
@@ -764,23 +681,17 @@ class BotRunner:
                         await self.delete_mailing(mailing_id, user_id)
                         logger.info(f"Рассылка {mailing_id} удалена (старше месяца).")
                         continue
-
-                # Если рассылка не старше месяца, отображаем название (если его нет, используем id)
-                display = mailing_name if mailing_name and mailing_name.strip() else f"Рассылка {mailing_id}"
-                buttons.append([Button.inline(display, f"show_mailing_{mailing_id}")])
+                display = mailing[1] if mailing[1] and mailing[1].strip() else f"Рассылка {mailing_id}"
+                buttons = [[Button.inline(display, f"show_mailing_{mailing_id}")]]
+            if not mailings:
+                buttons_empty = [[Button.inline("Назад", b"back")]]
+                await event.respond("История рассылок пуста.", buttons=buttons_empty)
+                return
+            buttons.append([Button.inline("Назад", b"back")])
+            await event.respond("Выберите рассылку для просмотра:", buttons=buttons)
         finally:
             await conn.close()
-
-        if not buttons:
-            buttons_empty = [[Button.inline("Назад", b"back")]]
-            await event.respond("История рассылок пуста.", buttons=buttons_empty)
-            return
-
-        buttons.append([Button.inline("Назад", b"back")])
-        await event.respond("Выберите рассылку для просмотра:", buttons=buttons)
-
     async def delete_mailing(self, mailing_id, user_id):
-        """Удаляет рассылку из базы данных по её ID."""
         conn = await self.get_db_connection()
         try:
             await conn.execute("DELETE FROM mailings WHERE id = ? AND user_id = ?", (mailing_id, user_id))
@@ -796,38 +707,24 @@ class BotRunner:
         mailing_id = int(event.pattern_match.group(1))
         user_id = event.sender_id
         await event.respond("Обработка...")
-
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
-            # Получаем информацию о рассылке
-            await cursor.execute(
-                "SELECT groups, message, photo_path FROM mailings WHERE id = ? AND user_id = ?",
-                (mailing_id, user_id)
-            )
+            await cursor.execute("SELECT group_names, message, photo_path FROM mailings WHERE id = ? AND user_id = ?", (mailing_id, user_id))
             mailing = await cursor.fetchone()
             if not mailing:
                 await event.answer("Рассылка не найдена.")
                 return
-
             groups, message, photo_path = mailing
             response = f"Группы: {groups}\nСообщение: {message}"
-
-            # Получаем времена отправки для этой рассылки
-            await cursor.execute(
-                "SELECT send_time FROM mailing_times WHERE mailing_id = ? ORDER BY send_time ASC",
-                (mailing_id,)
-            )
+            await cursor.execute("SELECT send_time FROM mailing_times WHERE mailing_id = ? ORDER BY send_time ASC", (mailing_id,))
             times = await cursor.fetchall()
-
             if times:
                 times_str = "\nВремена отправки:\n"
-                for time in times:
-                    send_time = datetime.strptime(time[0], '%Y-%m-%d %H:%M')
+                for time_row in times:
+                    send_time = datetime.strptime(time_row[0], '%Y-%m-%d %H:%M')
                     times_str += f"- {send_time.strftime('%H:%M')}, "
                 response += times_str
-
-            # Если есть фото, отправляем его через client.send_file, так как event.respond не поддерживает caption
             if photo_path:
                 if len(response) > MAX_CAPTION_LENGTH:
                     caption = response[:MAX_CAPTION_LENGTH]
@@ -839,8 +736,6 @@ class BotRunner:
                     await event.client.send_file(event.chat_id, photo_path, caption=response)
             else:
                 await event.respond(response)
-
-            # Добавляем кнопки для удаления рассылки и кнопку "Назад"
             await event.respond("Выберите действие:", buttons=[
                 [Button.inline("Удалить рассылку", f"delete_mailing_{mailing_id}")],
                 [Button.inline("Назад", b"back_to_mailing_list")]
@@ -851,13 +746,11 @@ class BotRunner:
     async def delete_mailing_handler(self, event):
         mailing_id = int(event.pattern_match.group(1))
         user_id = event.sender_id
-
         await self.delete_mailing(mailing_id, user_id)
         await event.respond(f"Рассылка {mailing_id} удалена.")
         await self.show_mailing_list(event, user_id)
 
     async def fetch_users(self):
-        """Возвращает список пользователей из базы данных."""
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
@@ -879,26 +772,18 @@ class BotRunner:
             await conn.close()
 
     async def delete_user(self, user_db_id):
-        """Удаляет пользователя из базы данных по ID и его сессию."""
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
             logger.info(f"Попытка удалить пользователя с ID: {user_db_id}")
-
-            # Получаем user_id (Telegram ID) пользователя по его ID в базе данных
             await cursor.execute("SELECT user_id FROM users WHERE id = ?", (user_db_id,))
             user = await cursor.fetchone()
             if user:
                 user_id = user[0]
-                # Удаляем запись из базы данных
                 await cursor.execute("DELETE FROM users WHERE id = ?", (user_db_id,))
                 await conn.commit()
                 logger.info(f"Пользователь с ID {user_db_id} удалён из базы данных.")
-
-                # Удаляем сессию пользователя
                 self.delete_user_session(user_id)
-
-                # Очищаем состояние пользователя
                 if user_id in self.user_states:
                     del self.user_states[user_id]
                     logger.info(f"Состояние пользователя {user_id} очищено.")
@@ -914,61 +799,51 @@ class BotRunner:
         return username.strip().lower()
 
     async def user_exists(self, username):
-        """Проверяет, существует ли пользователь с таким именем."""
-        normalized_username = self.normalize_username(username)
+        normalized_username = username.strip().lower()
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
             await cursor.execute("SELECT username FROM users")
             users = await cursor.fetchall()
             for user in users:
-                if self.normalize_username(user[0]) == normalized_username:
+                if user[0].strip().lower() == normalized_username:
                     return True
             return False
         finally:
             await conn.close()
 
     async def show_user_selection(self, event, state):
-        """Отображает список пользователей с кнопками выбора."""
         users = state['users']
         selected_users = state.get('selected_users', [])
-
-        # Формируем список кнопок
         buttons = []
         for user in users:
-            user_db_id = user[0]  # ID из базы данных
-            user_id = user[1]  # user_id из Telegram
+            user_db_id = user[0]
+            user_id = user[1]
             username = user[2] if user[2] else "Без username"
             first_name = user[3] if user[3] else ""
             last_name = user[4] if user[4] else ""
-            is_active = user[5]  # Новый столбец is_active
+            is_active = user[5]
             display_name = f"{user_db_id}: {username} ({first_name} {last_name})".strip()
             mark = "✅" if user_db_id in selected_users else "🔲"
             status = "🟢" if is_active else "🔴"
             buttons.append([Button.inline(f"{mark} {status} {display_name}", f"select_user_{user_db_id}")])
-
-        # Добавляем кнопки "Заблокировать", "Разблокировать" и "Отмена"
         buttons.append([
             Button.inline("Заблокировать", b"ban_selected_users"),
             Button.inline("Разблокировать", b"unban_selected_users"),
             Button.inline("Отмена", b"cancel_user_selection")
         ])
-
-        # Если это коллбэк (CallbackQuery), используем event.edit, иначе event.respond
         if isinstance(event, events.CallbackQuery.Event):
             await event.edit("Выберите пользователей для управления доступом:", buttons=buttons)
         else:
             await event.respond("Выберите пользователей для управления доступом:", buttons=buttons)
 
     def delete_user_session(self, user_id):
-        """Удаляет файл сессии пользователя."""
         session_path = self.get_session_path(user_id)
         if os.path.exists(session_path):
             os.remove(session_path)
             logger.info(f"Сессия пользователя {user_id} удалена.")
         else:
             logger.info(f"Файл сессии пользователя {user_id} не найден.")
-
     async def print_all_users(self):
         """Выводит всех пользователей из базы данных."""
         conn = await self.get_db_connection()
@@ -997,17 +872,11 @@ class BotRunner:
     async def help_command(self, event):
         user_id = event.sender_id
         logger.info(f"User {user_id} requested help.")
-
-        # Путь к видеофайлу
-        video_path = "help_video/IMG_7569.MOV"  # Укажите путь к вашему видеофайлу
-
-        # Проверяем, существует ли файл
+        video_path = "help_video/IMG_7569.MOV"
         if not os.path.exists(video_path):
             await event.respond("Видео не найдено. Пожалуйста, свяжитесь с администратором.")
             logger.error(f"Video file not found: {video_path}")
             return
-
-        # Отправляем видео
         try:
             await event.respond("Загрузка видео... (это может занять несколько минут)")
             await event.respond("Вот видео с инструкцией:", file=video_path)
@@ -1017,7 +886,6 @@ class BotRunner:
             logger.error(f"Error sending video to user {user_id}: {e}")
 
     async def is_user_authorized(self, user_id):
-        """Проверяет, авторизован ли пользователь и существует ли он в базе данных."""
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
@@ -1028,68 +896,42 @@ class BotRunner:
             await conn.close()
 
     async def show_time_selection(self, event, state):
-        """Отображает кнопки с временами для выбора, учитывая интервал."""
-        interval = state.get('interval', 30)  # По умолчанию интервал 30 минут
+        interval = state.get('interval', 30)
         selected_times = state.get('selected_times', [])
-
-        # Если интервал меньше 15 минут, ограничиваем общее количество кнопок до количества для 15 минут (96)
-        if interval < 15:
-            total_slots = (24 * 60) // 15  # 96 кнопок
-        else:
-            total_slots = (24 * 60) // interval
-
+        total_slots = (24 * 60) // (15 if interval < 15 else interval)
         now = datetime.now()
         start_time = now + timedelta(minutes=2)
-
-        # Если selected_times пуст, заполняем его значениями по умолчанию
         if not selected_times:
             selected_times = []
             for i in range(total_slots):
                 send_time = start_time + timedelta(minutes=i * interval)
                 selected_times.append((send_time.hour, send_time.minute))
             state['selected_times'] = selected_times
-
         buttons = []
         row = []
         for i in range(total_slots):
             send_time = start_time + timedelta(minutes=i * interval)
             hour = send_time.hour
             minute = send_time.minute
-
             mark = "✅" if (hour, minute) in selected_times else "🕒"
             row.append(Button.inline(f"{mark} {hour:02d}:{minute:02d}", f"select_hour_{hour}_{minute}"))
-
-            if len(row) == 2:  # Два времени в строке
+            if len(row) == 2:
                 buttons.append(row)
                 row = []
-
         if row:
             buttons.append(row)
-
-        # Добавляем кнопки "Подтвердить" и "Назад"
         buttons.append([Button.inline("Подтвердить", b"confirm_mailing")])
         buttons.append([Button.inline("Назад", b"back_to_interval")])
-
         if isinstance(event, events.CallbackQuery.Event):
             try:
-                await event.edit(
-                    "Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):",
-                    buttons=buttons
-                )
+                await event.edit("Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):", buttons=buttons)
             except Exception as e:
                 logger.error(f"Ошибка при редактировании сообщения: {e}")
-                await event.respond(
-                    "Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):",
-                    buttons=buttons
-                )
+                await event.respond("Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):", buttons=buttons)
         else:
-            await event.respond(
-                "Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):",
-                buttons=buttons
-            )
+            await event.respond("Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):", buttons=buttons)
 
     async def show_group_selection(self, event, state):
-        # Определяем тип групп через явную проверку
         if 'admin_groups' in state:
             all_groups = state['admin_groups']
             group_type = 'Админские группы'
@@ -1099,92 +941,123 @@ class BotRunner:
         else:
             await event.answer("Ошибка: группы не загружены")
             return
-
-        # Остальная часть метода без изменений
         selected_ids = state.get('selected', [])
         buttons = []
-
         for group in all_groups:
             group_id = group.id
             group_name = getattr(group.entity, 'title', f"Группа {group_id}")[:20]
             mark = "✅" if group_id in selected_ids else "🔲"
             buttons.append([Button.inline(f"{mark} {group_name}", f"select_{group_id}")])
-
-        buttons.append([
-            Button.inline(f"Подтвердить ({len(selected_ids)} выбрано)", b"confirm_selection"),
-            Button.inline("Назад", b"back")
-        ])
-
-        message = (
-            f"<b>{group_type}</b>\n"
-            f"Выбрано: {len(selected_ids)} из {len(all_groups)}"
-        )
-
+        buttons.append([Button.inline(f"Подтвердить ({len(selected_ids)} выбрано)", b"confirm_selection"),
+                        Button.inline("Назад", b"back")])
+        message = f"<b>{group_type}</b>\nВыбрано: {len(selected_ids)} из {len(all_groups)}"
         if isinstance(event, events.CallbackQuery.Event):
             await event.edit(message, parse_mode='HTML', buttons=buttons)
         else:
             await event.respond(message, parse_mode='HTML', buttons=buttons)
+
+    async def process_pending_mailings(self):
+        """Фоновая задача: каждые 60 секунд проверяет незавершённые рассылки и отправляет их."""
+        while True:
+            now = datetime.now()
+            conn = await self.get_db_connection()
+            try:
+                cursor = await conn.cursor()
+                await cursor.execute("SELECT id, mailing_id, send_time FROM mailing_times WHERE is_sent = 0")
+                rows = await cursor.fetchall()
+            finally:
+                await conn.close()
+            for mt_row in rows:
+                mt_id, mailing_id, send_time_str = mt_row
+                send_time = datetime.strptime(send_time_str, '%Y-%m-%d %H:%M')
+                if send_time <= now:
+                    # Получаем данные рассылки
+                    conn = await self.get_db_connection()
+                    try:
+                        cursor = await conn.cursor()
+                        await cursor.execute(
+                            "SELECT user_id, group_ids, message, photo_path FROM mailings WHERE id = ?", (mailing_id,))
+                        mailing = await cursor.fetchone()
+                    finally:
+                        await conn.close()
+                    if mailing:
+                        m_user_id, group_ids_str, message, photo_path = mailing
+                        client = await self.load_user_session(m_user_id)
+                        if not client:
+                            logger.error(f"Не удалось загрузить сессию для пользователя {m_user_id}")
+                            continue
+                        try:
+                            group_ids = [int(x) for x in group_ids_str.split(",") if x.strip()]
+                        except Exception as e:
+                            logger.error(f"Ошибка парсинга group_ids: {e}")
+                            continue
+                        groups = []
+                        for gid in group_ids:
+                            try:
+                                entity = await client.get_entity(gid)
+                                group_obj = type("Group", (), {})()
+                                group_obj.id = gid
+                                group_obj.name = getattr(entity, 'title', str(gid))
+                                groups.append(group_obj)
+                            except Exception as e:
+                                logger.error(f"Ошибка получения группы {gid}: {e}")
+                        media = None
+                        if photo_path:
+                            media = {'type': 'photo', 'path': photo_path}
+                        async with client:
+                            for group in groups:
+                                await self.send_with_retry(client, group, message, media)
+                        # Обновляем статус в БД: помечаем рассылку как отправленную
+                        conn = await self.get_db_connection()
+                        try:
+                            await conn.execute("UPDATE mailing_times SET is_sent = 1 WHERE id = ?", (mt_id,))
+                            await conn.commit()
+                            logger.info(f"Рассылка (mailing_time ID: {mt_id}) отправлена и отмечена как выполненная.")
+                        finally:
+                            await conn.close()
+            await asyncio.sleep(60)
+
     async def handle_response(self, event):
         user_id = event.sender_id
         if user_id not in self.user_states:
             logger.info(f"Ignoring message from user {user_id} (no state).")
             return
-
         state = self.user_states[user_id]
         logger.info(f"User {user_id} is at stage: {state['stage']}")
-
-        # Игнорируем команды (сообщения, начинающиеся с "/"), кроме /confirm
         if event.raw_text.startswith('/') and event.raw_text.strip().lower() != '/confirm':
             logger.info(f"Ignoring command from user {user_id}: {event.raw_text}")
             return
-
-        # Шаг 1: запрос номера телефона
         if state['stage'] == 'waiting_phone':
             phone_number = event.raw_text.strip()
             if not re.match(r'^\+\d{11,12}$', phone_number):
                 await event.respond("Ошибка! Введите номер телефона в формате +XXXXXXXXXXX.")
                 return
-
-            # Сохраняем номер телефона
             state['stage'] = 'waiting_code'
             logger.info(f"User {user_id} entered phone number: {phone_number}")
-
-            # Запрашиваем код авторизации
             session_path = self.get_session_path(user_id)
-            client = None  # Инициализируем переменную заранее
-
+            client = None
             try:
-                # Создаем новый клиент для каждой попытки авторизации
                 client = TelegramClient(
                     session_path,
                     self.config['api_id'],
                     self.config['api_hash'],
                     proxy=self.config['proxy']
                 )
-
-                # Явное подключение с таймаутом
                 await client.connect()
-
                 if not client.is_connected():
                     await event.respond("Ошибка подключения к серверам Telegram.")
                     return
-
-                # Сохраняем клиент ДО отправки кода
                 self.phone_codes[user_id] = {
                     'client': client,
                     'phone_number': phone_number,
                     'phone_code_hash': None,
                     'current_code': ''
                 }
-
                 code_request = await client.send_code_request(phone_number)
                 self.phone_codes[user_id]['phone_code_hash'] = code_request.phone_code_hash
-
                 logger.info(f"Connected: {client.is_connected()}")
                 logger.info(f"Authorized: {await client.is_user_authorized()}")
-
                 await event.respond("✅ Код авторизации отправлен. Вводите цифры по одной.")
-
             except FloodWaitError as e:
                 wait_time = e.seconds
                 error_msg = f"⚠️ Слишком много попыток. Попробуйте через {wait_time // 60} минут."
@@ -1193,7 +1066,6 @@ class BotRunner:
                 if client:
                     await client.disconnect()
                 return
-
             except Exception as e:
                 error_msg = f"Ошибка: {str(e)}"
                 logger.error(f"Error sending code: {error_msg}")
@@ -1201,58 +1073,39 @@ class BotRunner:
                 if client and client.is_connected():
                     await client.disconnect()
                 return
-
-        # Шаг 2: ввод кода авторизации
         elif state['stage'] == 'waiting_code':
             digit = event.raw_text.strip()
             if not digit.isdigit() or len(digit) != 1:
                 await event.respond("Ошибка! Введите одну цифру.")
                 return
-
-            # Проверяем наличие данных сессии
             if user_id not in self.phone_codes:
                 await event.respond("🚫 Сессия устарела. Начните заново.")
                 state['stage'] = 'waiting_phone'
                 return
-
             phone_data = self.phone_codes[user_id]
             phone_data['current_code'] += digit
             current_code = phone_data['current_code']
-
             if len(current_code) < 5:
                 await event.respond(f"Введено цифр: {len(current_code)}. Введите следующую цифру.")
                 return
-
             client = phone_data.get('client')
-
-            # Дополнительная проверка клиента
             if not client or not isinstance(client, TelegramClient):
                 await event.respond("🚫 Ошибка клиента. Начните заново.")
                 state['stage'] = 'waiting_phone'
                 del self.phone_codes[user_id]
                 return
-
             try:
-                # Гарантированное подключение
                 if not client.is_connected():
                     await client.connect(timeout=10)
-
-                # Выполняем вход с проверкой кода
                 result = await client.sign_in(
                     phone=phone_data['phone_number'],
                     code=current_code,
                     phone_code_hash=phone_data['phone_code_hash']
                 )
-
-                # Успешная авторизация
                 if isinstance(result, types.User):
                     state['client'] = client
                     state['stage'] = 'authorized'
-
-                    # Сохраняем сессию
                     client.session.save()
-
-                    # Сохраняем пользователя
                     user_info = await client.get_me()
                     await self.save_user(
                         user_id,
@@ -1260,35 +1113,25 @@ class BotRunner:
                         user_info.first_name,
                         user_info.last_name
                     )
-
-                    # Проверяем, является ли пользователь владельцем
                     if user_id != self.config['owner_id']:
-                        # Если пользователь не владелец, блокируем его
                         await self.ban_user(user_id)
-                        await event.respond(
-                            "Вы успешно авторизованы, но ваш доступ ограничен. Обратитесь к администратору для получения доступа. @JerdeshMoskva_admin затем снова нажмите /start"
-                        )
+                        await event.respond("Вы успешно авторизованы, но ваш доступ ограничен. Обратитесь к администратору для получения доступа. @JerdeshMoskva_admin затем снова нажмите /start")
                     else:
                         await event.respond("✅ Авторизация успешна! Теперь вы можете использовать бота.")
                         await event.respond("Выберите действие:", buttons=[
                             [Button.inline("Создать рассылку", b"create_mailing")],
                             [Button.inline("Список рассылок", b"mailing_list")]
                         ])
-
-                    # Очищаем временные данные
                     del self.phone_codes[user_id]
-
             except SessionPasswordNeededError:
                 state['stage'] = 'waiting_password'
-                state['client'] = client  # Сохраняем клиент в состоянии
+                state['client'] = client
                 await event.respond("🔐 Введите пароль двухфакторной аутентификации:")
-
             except PhoneCodeInvalidError:
                 await event.respond("❌ Неверный код. Попробуйте снова.")
                 await client.disconnect()
                 state['stage'] = 'waiting_phone'
                 del self.phone_codes[user_id]
-
             except Exception as e:
                 logger.error(f"Critical sign-in error: {str(e)}")
                 await event.respond("⚠️ Критическая ошибка. Начните процесс заново.")
@@ -1296,34 +1139,23 @@ class BotRunner:
                     await client.disconnect()
                 state['stage'] = 'waiting_phone'
                 del self.phone_codes[user_id]
-
-        # В разделе обработки waiting_password:
         elif state['stage'] == 'waiting_password':
             password = event.raw_text.strip()
             try:
                 client = self.phone_codes[user_id]['client']
                 await client.sign_in(password=password)
-
                 state['client'] = client
-                state['stage'] = 'authorized'  # Важно обновить состояние
-
-                # Сохраняем информацию о пользователе
+                state['stage'] = 'authorized'
                 user_info = await client.get_me()
                 await self.save_user(user_id, user_info.username, user_info.first_name, user_info.last_name)
-
-                # Проверяем статус пользователя
                 conn = await self.get_db_connection()
                 try:
                     cursor = await conn.cursor()
                     await cursor.execute("SELECT is_active FROM users WHERE user_id = ?", (user_id,))
                     user = await cursor.fetchone()
-
-                    # Проверяем, является ли пользователь владельцем
                     if user_id != self.config['owner_id']:
-                        # Если пользователь не владелец, блокируем его
                         await self.ban_user(user_id)
-                        await event.respond(
-                            "Вы успешно авторизованы, но ваш доступ ограничен. Обратитесь к администратору для получения доступа. @JerdeshMoskva_admin затем снова нажмите /start")
+                        await event.respond("Вы успешно авторизованы, но ваш доступ ограничен. Обратитесь к администратору для получения доступа. @JerdeshMoskva_admin затем снова нажмите /start")
                     else:
                         await event.respond("Авторизация успешна!")
                         await event.respond("Вы уже авторизованы! Выберите действие:", buttons=[
@@ -1332,45 +1164,36 @@ class BotRunner:
                         ])
                     logger.info(f"User {user_id} successfully authorized.")
                     state['stage'] = 'authorized'
-
                 finally:
                     await conn.close()
-
             except Exception as e:
                 logger.error(f"Error during 2FA sign-in: {e}")
                 await event.respond("Ошибка! Неверный пароль. Попробуйте снова.")
-
         elif state['stage'] == 'entering_mailing_title':
             state['mailing_name'] = event.raw_text.strip()
             state['stage'] = 'waiting_media'
             await event.respond("Отправьте фото или медиа для рассылки или введите 'пропустить'.")
-
-        # Шаг 4: ожидание медиа (фото или видео)
         elif state['stage'] == 'waiting_media':
             if event.raw_text.lower() == 'пропустить':
                 state['media'] = None
                 state['stage'] = 'entering_text'
                 await event.respond("Введите текст рассылки:")
                 logger.info(f"User {user_id} skipped media. Moving to 'entering_text' stage.")
-                return  # Добавляем return, чтобы избежать дальнейшей обработки
+                return
             elif event.photo or event.video or event.document:
                 try:
                     await event.respond("Обработка...")
                     if event.photo:
-                        # Обработка фото
                         media_path = await event.download_media(file="media/")
                         state['media'] = {'type': 'photo', 'path': media_path}
                         logger.info(f"[DEBUG] Фото сохранено в: {media_path}")
                     elif event.video or (event.document and event.document.mime_type.startswith('video/')):
-                        # Обработка видео
                         media_path = await event.download_media(file="media/")
                         state['media'] = {'type': 'video', 'path': media_path}
                         logger.info(f"[DEBUG] Видео сохранено в: {media_path}")
                     else:
                         await event.respond("Ошибка! Отправьте фото или видео.")
                         return
-
-                    # Переход к следующему этапу
                     state['stage'] = 'entering_text'
                     logger.info(f"User {user_id} media processed. Moving to 'entering_text' stage.")
                 except Exception as e:
@@ -1378,13 +1201,9 @@ class BotRunner:
                     await event.respond("Ошибка! Не удалось обработать медиафайл. Попробуйте снова.")
             else:
                 await event.respond("Ошибка! Отправьте фото, видео или введите 'пропустить'.")
-
-        # Шаг 5: ввод текста рассылки
         if state['stage'] == 'entering_text':
             state['text'] = event.raw_text
             state['stage'] = 'choosing_interval'
-
-            # Предлагаем выбрать интервал
             await event.respond("Выберите интервал отправки (не меньше 15 минут):", buttons=[
                 [Button.inline("15 минут", b"select_interval_15")],
                 [Button.inline("20 минут", b"select_interval_20")],
@@ -1392,41 +1211,31 @@ class BotRunner:
                 [Button.inline("1 час", b"select_interval_60")],
                 [Button.inline("Другое время", b"custom_interval")]
             ])
-
             logger.info(f"User {user_id} entered text. Moving to 'choosing_interval' stage.")
-
-        # Обработка ввода пользовательского интервала
         elif state['stage'] == 'waiting_custom_interval':
             try:
                 interval = int(event.raw_text.strip())
                 if interval <= 0:
                     await event.respond("Интервал должен быть положительным числом.")
                     return
-
                 state['interval'] = interval
-                state['selected_times'] = []  # Очищаем выбранные времена
+                state['selected_times'] = []
                 await self.show_time_selection(event, state)
             except ValueError:
                 await event.respond("Ошибка! Введите число (например, 45 и не меньше 15).")
             return
-
-        # Шаг 7: удаление пользователя (для владельца)
         elif state['stage'] == 'waiting_user_to_delete':
             if user_id != self.config['owner_id']:
                 await event.respond("Эта функция доступна только владельцу бота.")
                 return
-
             username_to_delete = event.raw_text.strip()
             logger.info(f"Введённое имя пользователя: '{username_to_delete}'")
-
             if await self.user_exists(username_to_delete):
                 await self.delete_user(username_to_delete)
                 await event.respond(f"Пользователь {username_to_delete} удалён.")
             else:
                 await event.respond(f"Пользователь {username_to_delete} не найден.")
-
             state['stage'] = 'authorized'
-
         logger.info(f"Бот {self.config['bot_name']} запущен")
         await self.client.run_until_disconnected()
 
