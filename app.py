@@ -957,7 +957,8 @@ class BotRunner:
             await event.respond(message, parse_mode='HTML', buttons=buttons)
 
     async def process_pending_mailings(self):
-        """Фоновая задача: каждые 60 секунд проверяет незавершённые рассылки и отправляет их."""
+        """Фоновая задача: каждые 60 секунд проверяет незавершённые рассылки и отправляет их.
+        Если время отправки просрочено более чем на 2 минуты, то рассылка для этого времени пропускается."""
         while True:
             now = datetime.now()
             conn = await self.get_db_connection()
@@ -967,19 +968,31 @@ class BotRunner:
                 rows = await cursor.fetchall()
             finally:
                 await conn.close()
+
             for mt_row in rows:
                 mt_id, mailing_id, send_time_str = mt_row
                 send_time = datetime.strptime(send_time_str, '%Y-%m-%d %H:%M')
                 if send_time <= now:
-                    # Получаем данные рассылки
+                    # Если время отправки просрочено более чем на 2 минуты, пропускаем отправку
+                    if (now - send_time).total_seconds() > 120:
+                        logger.info(f"Время отправки (mailing_time ID: {mt_id}) прошло более 2 минут. Пропускаем отправку.")
+                        conn = await self.get_db_connection()
+                        try:
+                            await conn.execute("UPDATE mailing_times SET is_sent = 1 WHERE id = ?", (mt_id,))
+                            await conn.commit()
+                        finally:
+                            await conn.close()
+                        continue
+
+                    # Получаем данные рассылки для отправки
                     conn = await self.get_db_connection()
                     try:
                         cursor = await conn.cursor()
-                        await cursor.execute(
-                            "SELECT user_id, group_ids, message, photo_path FROM mailings WHERE id = ?", (mailing_id,))
+                        await cursor.execute("SELECT user_id, group_ids, message, photo_path FROM mailings WHERE id = ?", (mailing_id,))
                         mailing = await cursor.fetchone()
                     finally:
                         await conn.close()
+
                     if mailing:
                         m_user_id, group_ids_str, message, photo_path = mailing
                         client = await self.load_user_session(m_user_id)
@@ -1007,7 +1020,6 @@ class BotRunner:
                         async with client:
                             for group in groups:
                                 await self.send_with_retry(client, group, message, media)
-                        # Обновляем статус в БД: помечаем рассылку как отправленную
                         conn = await self.get_db_connection()
                         try:
                             await conn.execute("UPDATE mailing_times SET is_sent = 1 WHERE id = ?", (mt_id,))
