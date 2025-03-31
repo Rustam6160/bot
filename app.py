@@ -665,11 +665,15 @@ class BotRunner:
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
-            await cursor.execute("SELECT id, name, group_names, message, photo_path FROM mailings WHERE user_id = ?", (user_id,))
+            await cursor.execute("SELECT id, name, group_names, message, photo_path FROM mailings WHERE user_id = ?",
+                                 (user_id,))
             mailings = await cursor.fetchall()
+            buttons = []  # Инициализируем список кнопок
             for mailing in mailings:
                 mailing_id = mailing[0]
-                await cursor.execute("SELECT send_time FROM mailing_times WHERE mailing_id = ? ORDER BY send_time ASC LIMIT 1", (mailing_id,))
+                await cursor.execute(
+                    "SELECT send_time FROM mailing_times WHERE mailing_id = ? ORDER BY send_time ASC LIMIT 1",
+                    (mailing_id,))
                 first_send_time = await cursor.fetchone()
                 if first_send_time:
                     first_send_time_dt = datetime.strptime(first_send_time[0], '%Y-%m-%d %H:%M')
@@ -682,8 +686,8 @@ class BotRunner:
                         logger.info(f"Рассылка {mailing_id} удалена (старше месяца).")
                         continue
                 display = mailing[1] if mailing[1] and mailing[1].strip() else f"Рассылка {mailing_id}"
-                buttons = [[Button.inline(display, f"show_mailing_{mailing_id}")]]
-            if not mailings:
+                buttons.append([Button.inline(display, f"show_mailing_{mailing_id}")])
+            if not buttons:
                 buttons_empty = [[Button.inline("Назад", b"back")]]
                 await event.respond("История рассылок пуста.", buttons=buttons_empty)
                 return
@@ -691,6 +695,7 @@ class BotRunner:
             await event.respond("Выберите рассылку для просмотра:", buttons=buttons)
         finally:
             await conn.close()
+
     async def delete_mailing(self, mailing_id, user_id):
         conn = await self.get_db_connection()
         try:
@@ -948,8 +953,8 @@ class BotRunner:
             group_name = getattr(group.entity, 'title', f"Группа {group_id}")[:20]
             mark = "✅" if group_id in selected_ids else "🔲"
             buttons.append([Button.inline(f"{mark} {group_name}", f"select_{group_id}")])
-        buttons.append([Button.inline(f"Подтвердить ({len(selected_ids)} выбрано)", b"confirm_selection"),
-                        Button.inline("Назад", b"back")])
+        buttons.append([Button.inline("Назад", b"back"),
+                        Button.inline(f"Подтвердить ({len(selected_ids)} выбрано)", b"confirm_selection")])
         message = f"<b>{group_type}</b>\nВыбрано: {len(selected_ids)} из {len(all_groups)}"
         if isinstance(event, events.CallbackQuery.Event):
             await event.edit(message, parse_mode='HTML', buttons=buttons)
