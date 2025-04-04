@@ -47,7 +47,6 @@ class BotRunner:
         conn = await aiosqlite.connect(self.config['db_file'])
         try:
             await conn.executescript('''
-                -- Таблица рассылок теперь хранит названия групп и их ID (разделённые запятыми)
                 CREATE TABLE IF NOT EXISTS mailings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
@@ -55,15 +54,16 @@ class BotRunner:
                     group_names TEXT,
                     group_ids TEXT,
                     message TEXT,
-                    photo_path TEXT
+                    photo_path TEXT,
+                    interval INTEGER
                 );
 
-                -- Добавлен флаг is_sent (0 – не отправлено, 1 – отправлено)
+                -- Изменённая таблица для хранения времени в часах и минутах
                 CREATE TABLE IF NOT EXISTS mailing_times (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     mailing_id INTEGER,
-                    send_time TEXT,
-                    is_sent INTEGER DEFAULT 0,
+                    hour INTEGER,
+                    minute INTEGER,
                     FOREIGN KEY(mailing_id) REFERENCES mailings(id)
                 );
 
@@ -342,7 +342,8 @@ class BotRunner:
                 selected_groups,
                 text,
                 media['path'] if media else None,
-                selected_times
+                selected_times,
+                state.get('interval', 30)  # Добавляем интервал из состояния
             )
             buttons = [
                 [Button.inline("Создать рассылку", b"create_mailing")],
@@ -431,8 +432,8 @@ class BotRunner:
         # Обработка выбора интервала отправки
         elif event.data.startswith(b"select_interval_"):
             interval = int(event.data.decode().replace("select_interval_", ""))
-            state['interval'] = interval
-            state['selected_times'] = []  # Очищаем выбранные времена
+            state['interval'] = interval  # Сохраняем интервал в состоянии
+            state['selected_times'] = []
             await self.show_time_selection(event, state)
             return
 
@@ -515,7 +516,7 @@ class BotRunner:
                 return
             state['selected_groups'] = selected_groups
             state['stage'] = 'entering_mailing_title'
-            await event.respond("Введите название рассылки:")
+            await event.respond("Введите название рассылки (максимум 10 символов):")
 
     # Папка для хранения сессий пользователей
     SESSION_FOLDER = "user_sessions"
@@ -611,7 +612,7 @@ class BotRunner:
         finally:
             await conn.close()
 
-    async def save_mailing(self, user_id, mailing_name, groups, message, photo_path, selected_times):
+    async def save_mailing(self, user_id, mailing_name, groups, message, photo_path, selected_times, interval):
         conn = await self.get_db_connection()
         try:
             group_names = []
@@ -627,19 +628,17 @@ class BotRunner:
 
             cursor = await conn.cursor()
             await cursor.execute(
-                "INSERT INTO mailings (user_id, name, group_names, group_ids, message, photo_path) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, mailing_name, group_names_str, group_ids_str, message, photo_path)
+                """INSERT INTO mailings 
+                (user_id, name, group_names, group_ids, message, photo_path, interval) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, mailing_name, group_names_str, group_ids_str, message, photo_path, interval)
             )
             mailing_id = cursor.lastrowid
 
             for hour, minute in selected_times:
-                send_time = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
-                # Если время уже прошло – планируем на следующий день
-                if send_time < datetime.now():
-                    send_time += timedelta(days=1)
                 await cursor.execute(
-                    "INSERT INTO mailing_times (mailing_id, send_time, is_sent) VALUES (?, ?, 0)",
-                    (mailing_id, send_time.strftime('%Y-%m-%d %H:%M'))
+                    "INSERT INTO mailing_times (mailing_id, hour, minute) VALUES (?, ?, ?)",
+                    (mailing_id, hour, minute)
                 )
             await conn.commit()
             return mailing_id
@@ -672,11 +671,14 @@ class BotRunner:
             for mailing in mailings:
                 mailing_id = mailing[0]
                 await cursor.execute(
-                    "SELECT send_time FROM mailing_times WHERE mailing_id = ? ORDER BY send_time ASC LIMIT 1",
+                    "SELECT hour, minute FROM mailing_times WHERE mailing_id = ? LIMIT 1",
                     (mailing_id,))
                 first_send_time = await cursor.fetchone()
                 if first_send_time:
-                    first_send_time_dt = datetime.strptime(first_send_time[0], '%Y-%m-%d %H:%M')
+                    hour, minute = first_send_time
+                    first_send_time_dt = datetime.now().replace(hour=hour, minute=minute, second=0)
+                    if first_send_time_dt < datetime.now():
+                        first_send_time_dt += timedelta(days=1)
                     if (datetime.now() - first_send_time_dt).days > 30:
                         photo_path = mailing[4]
                         if photo_path and os.path.exists(photo_path):
@@ -711,40 +713,42 @@ class BotRunner:
     async def show_mailing_details(self, event):
         mailing_id = int(event.pattern_match.group(1))
         user_id = event.sender_id
-        await event.respond("Обработка...")
         conn = await self.get_db_connection()
         try:
             cursor = await conn.cursor()
-            await cursor.execute("SELECT group_names, message, photo_path FROM mailings WHERE id = ? AND user_id = ?", (mailing_id, user_id))
+            await cursor.execute("""
+                SELECT m.name, m.group_names, m.message, m.photo_path, m.interval,
+                       GROUP_CONCAT(mt.hour || ':' || mt.minute, ', ') 
+                FROM mailings m
+                LEFT JOIN mailing_times mt ON m.id = mt.mailing_id
+                WHERE m.id = ? AND m.user_id = ?
+                GROUP BY m.id
+            """, (mailing_id, user_id))
+
             mailing = await cursor.fetchone()
             if not mailing:
                 await event.answer("Рассылка не найдена.")
                 return
-            groups, message, photo_path = mailing
-            response = f"Группы: {groups}\nСообщение: {message}"
-            await cursor.execute("SELECT send_time FROM mailing_times WHERE mailing_id = ? ORDER BY send_time ASC", (mailing_id,))
-            times = await cursor.fetchall()
-            if times:
-                times_str = "\nВремена отправки:\n"
-                for time_row in times:
-                    send_time = datetime.strptime(time_row[0], '%Y-%m-%d %H:%M')
-                    times_str += f"- {send_time.strftime('%H:%M')}, "
-                response += times_str
+
+            name, groups, message, photo_path, interval, times = mailing
+            response = (
+                f"📌 Название: {name}\n"
+                f"👥 Группы: {groups}\n"
+                f"⏱ Интервал: {interval} мин\n"
+                f"⏰ Времена отправки: {times}\n"
+                f"📝 Сообщение: {message[:50]}..."
+            )
+
             if photo_path:
-                if len(response) > MAX_CAPTION_LENGTH:
-                    caption = response[:MAX_CAPTION_LENGTH]
-                    await event.client.send_file(event.chat_id, photo_path, caption=caption)
-                    remaining_text = response[MAX_CAPTION_LENGTH:]
-                    for chunk in self.split_text(remaining_text):
-                        await event.respond(chunk)
-                else:
-                    await event.client.send_file(event.chat_id, photo_path, caption=response)
+                await event.client.send_file(event.chat_id, photo_path, caption=response)
             else:
                 await event.respond(response)
+
             await event.respond("Выберите действие:", buttons=[
                 [Button.inline("Удалить рассылку", f"delete_mailing_{mailing_id}")],
                 [Button.inline("Назад", b"back_to_mailing_list")]
             ])
+
         finally:
             await conn.close()
 
@@ -903,38 +907,94 @@ class BotRunner:
     async def show_time_selection(self, event, state):
         interval = state.get('interval', 30)
         selected_times = state.get('selected_times', [])
-        total_slots = (24 * 60) // (15 if interval < 15 else interval)
-        now = datetime.now()
-        start_time = now + timedelta(minutes=2)
-        if not selected_times:
-            selected_times = []
-            for i in range(total_slots):
-                send_time = start_time + timedelta(minutes=i * interval)
-                selected_times.append((send_time.hour, send_time.minute))
-            state['selected_times'] = selected_times
+
+        # Генерируем временные слоты на основе интервала в течение 24 часов
+        start_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        end_time = start_time + timedelta(days=1)
+        current_time = start_time
+
         buttons = []
+        time_slots = []
+
+        # Автоматически выбираем все времена при первом открытии
+        if not selected_times:
+            while current_time < end_time:
+                hour = current_time.hour
+                minute = current_time.minute
+                selected_times.append((hour, minute))
+                current_time += timedelta(minutes=interval)
+            state['selected_times'] = selected_times
+
+
+        # Создаём кнопки с учётом выбранных времён
+        current_time = start_time
         row = []
-        for i in range(total_slots):
-            send_time = start_time + timedelta(minutes=i * interval)
-            hour = send_time.hour
-            minute = send_time.minute
+        while current_time < end_time:
+            hour = current_time.hour
+            minute = current_time.minute
             mark = "✅" if (hour, minute) in selected_times else "🕒"
-            row.append(Button.inline(f"{mark} {hour:02d}:{minute:02d}", f"select_hour_{hour}_{minute}"))
-            if len(row) == 2:
+            btn = Button.inline(f"{mark} {hour:02d}:{minute:02d}", f"select_hour_{hour}_{minute}")
+
+            # Группируем по 4 кнопки в строку
+            if len(row) == 5:
                 buttons.append(row)
                 row = []
+            row.append(btn)
+
+            current_time += timedelta(minutes=interval)
+
+        # Добавляем последнюю неполную строку
         if row:
             buttons.append(row)
-        buttons.append([Button.inline("Подтвердить", b"confirm_mailing")])
-        buttons.append([Button.inline("Назад", b"back_to_interval")])
-        if isinstance(event, events.CallbackQuery.Event):
-            try:
-                await event.edit("Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):", buttons=buttons)
-            except Exception as e:
-                logger.error(f"Ошибка при редактировании сообщения: {e}")
-                await event.respond("Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):", buttons=buttons)
-        else:
-            await event.respond("Выберите время рассылки (все времена выбраны по умолчанию, отмените ненужные):", buttons=buttons)
+
+        control_buttons = [
+            [Button.inline("✅ Подтвердить", b"confirm_mailing")],
+            [Button.inline("🔙 Назад", b"back_to_interval")]
+        ]
+
+        MAX_BUTTONS = 98  # 100 - 2 управляющие кнопки
+
+        # Проверяем общее количество кнопок
+        total_buttons = sum(len(row) for row in buttons)
+
+        if total_buttons + 2 > 100:
+            # Удаляем лишние кнопки, оставляя место для управляющих
+            new_buttons = []
+            count = 0
+            for row in buttons:
+                if count + len(row) + 2 <= MAX_BUTTONS:
+                    new_buttons.append(row)
+                    count += len(row)
+                else:
+                    break
+
+            # Добавляем индикатор обрезки
+            new_buttons.append([Button.inline("...", b"noop")])
+            buttons = new_buttons
+
+        # Добавляем управляющие кнопки
+        buttons.extend(control_buttons)
+
+        # Формируем сообщение
+        message = (
+            "⏰ Все времена выбраны автоматически!\n"
+            "Можете снять выбор с ненужных времен\n"
+            f"Интервал: {interval} минут\n"
+            f"Выбрано времен: {len(selected_times)}"
+        )
+
+        try:
+            if isinstance(event, events.CallbackQuery.Event):
+                await event.edit(message, buttons=buttons)
+            else:
+                await event.respond(message, buttons=buttons)
+        except Exception as e:
+            error_msg = (
+                "⚠️ Слишком много вариантов времени. "
+                "Увеличьте интервал или выберите меньшее количество времен вручную."
+            )
+            logger.error(f"Ошибка отображения кнопок: {str(e)}")
+            await event.respond(error_msg)
 
     async def show_group_selection(self, event, state):
         if 'admin_groups' in state:
@@ -962,77 +1022,56 @@ class BotRunner:
             await event.respond(message, parse_mode='HTML', buttons=buttons)
 
     async def process_pending_mailings(self):
-        """Фоновая задача: каждые 60 секунд проверяет незавершённые рассылки и отправляет их.
-        Если время отправки просрочено более чем на 2 минуты, то рассылка для этого времени пропускается."""
+        """Фоновая задача: каждую минуту проверяет текущее время и отправляет рассылки"""
         while True:
             now = datetime.now()
+            current_hour = now.hour
+            current_minute = now.minute
+
             conn = await self.get_db_connection()
             try:
+                # Получаем все активные рассылки с текущим временем
                 cursor = await conn.cursor()
-                await cursor.execute("SELECT id, mailing_id, send_time FROM mailing_times WHERE is_sent = 0")
-                rows = await cursor.fetchall()
-            finally:
-                await conn.close()
+                await cursor.execute('''
+                    SELECT m.id, m.user_id, m.group_ids, m.message, m.photo_path, m.interval 
+                    FROM mailings m
+                    JOIN mailing_times mt ON m.id = mt.mailing_id
+                    WHERE mt.hour = ? AND mt.minute = ?
+                ''', (current_hour, current_minute))
+                mailings = await cursor.fetchall()
 
-            for mt_row in rows:
-                mt_id, mailing_id, send_time_str = mt_row
-                send_time = datetime.strptime(send_time_str, '%Y-%m-%d %H:%M')
-                if send_time <= now:
-                    # Если время отправки просрочено более чем на 2 минуты, пропускаем отправку
-                    if (now - send_time).total_seconds() > 120:
-                        logger.info(f"Время отправки (mailing_time ID: {mt_id}) прошло более 2 минут. Пропускаем отправку.")
-                        conn = await self.get_db_connection()
-                        try:
-                            await conn.execute("UPDATE mailing_times SET is_sent = 1 WHERE id = ?", (mt_id,))
-                            await conn.commit()
-                        finally:
-                            await conn.close()
+                for mailing in mailings:
+                    mailing_id, user_id, group_ids_str, message, photo_path, interval = mailing
+                    client = await self.load_user_session(user_id)
+
+                    if not client:
                         continue
 
-                    # Получаем данные рассылки для отправки
-                    conn = await self.get_db_connection()
                     try:
-                        cursor = await conn.cursor()
-                        await cursor.execute("SELECT user_id, group_ids, message, photo_path FROM mailings WHERE id = ?", (mailing_id,))
-                        mailing = await cursor.fetchone()
-                    finally:
-                        await conn.close()
-
-                    if mailing:
-                        m_user_id, group_ids_str, message, photo_path = mailing
-                        client = await self.load_user_session(m_user_id)
-                        if not client:
-                            logger.error(f"Не удалось загрузить сессию для пользователя {m_user_id}")
-                            continue
-                        try:
-                            group_ids = [int(x) for x in group_ids_str.split(",") if x.strip()]
-                        except Exception as e:
-                            logger.error(f"Ошибка парсинга group_ids: {e}")
-                            continue
+                        group_ids = [int(x) for x in group_ids_str.split(",")]
                         groups = []
                         for gid in group_ids:
                             try:
                                 entity = await client.get_entity(gid)
-                                group_obj = type("Group", (), {})()
-                                group_obj.id = gid
-                                group_obj.name = getattr(entity, 'title', str(gid))
-                                groups.append(group_obj)
+                                groups.append(entity)
                             except Exception as e:
                                 logger.error(f"Ошибка получения группы {gid}: {e}")
-                        media = None
-                        if photo_path:
-                            media = {'type': 'photo', 'path': photo_path}
+
+                        media = {'type': 'photo', 'path': photo_path} if photo_path else None
+
                         async with client:
                             for group in groups:
                                 await self.send_with_retry(client, group, message, media)
-                        conn = await self.get_db_connection()
-                        try:
-                            await conn.execute("UPDATE mailing_times SET is_sent = 1 WHERE id = ?", (mt_id,))
-                            await conn.commit()
-                            logger.info(f"Рассылка (mailing_time ID: {mt_id}) отправлена и отмечена как выполненная.")
-                        finally:
-                            await conn.close()
-            await asyncio.sleep(60)
+
+                        logger.info(f"Рассылка {mailing_id} отправлена в {current_hour:02d}:{current_minute:02d}")
+
+                    except Exception as e:
+                        logger.error(f"Ошибка при отправке рассылки {mailing_id}: {e}")
+
+            finally:
+                await conn.close()
+
+            await asyncio.sleep(60 - datetime.now().second)  # Проверяем каждую минуту
 
     async def handle_response(self, event):
         user_id = event.sender_id
@@ -1186,10 +1225,16 @@ class BotRunner:
             except Exception as e:
                 logger.error(f"Error during 2FA sign-in: {e}")
                 await event.respond("Ошибка! Неверный пароль. Попробуйте снова.")
+
         elif state['stage'] == 'entering_mailing_title':
-            state['mailing_name'] = event.raw_text.strip()
+            mailing_name = event.raw_text.strip()
+            if len(mailing_name) > 10:
+                await event.respond("❌ Название не может быть длиннее 10 символов. Введите снова:")
+                return
+            state['mailing_name'] = mailing_name[:10]  # Обрезаем до 10 символов
             state['stage'] = 'waiting_media'
             await event.respond("Отправьте фото или медиа для рассылки или введите 'пропустить'.")
+
         elif state['stage'] == 'waiting_media':
             if event.raw_text.lower() == 'пропустить':
                 state['media'] = None
