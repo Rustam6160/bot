@@ -9,6 +9,11 @@ import aiosqlite
 from telethon.errors import SessionPasswordNeededError, PhoneNumberInvalidError, FloodWaitError, PhoneCodeInvalidError
 from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator, Channel
 from telethon import types
+from telethon.tl.types import (
+    InputMediaUploadedPhoto,
+    InputMediaUploadedDocument,
+    DocumentAttributeVideo
+)
 
 
 from proxy_config import proxy, proxy2
@@ -536,30 +541,55 @@ class BotRunner:
         for attempt in range(max_attempts):
             try:
                 if media:
+                    # Определяем тип медиа и отправляем с правильными параметрами
                     if media['type'] == 'photo':
-                        if len(text) <= MAX_CAPTION_LENGTH:
-                            await client.send_file(group.id, media['path'], caption=text)
-                        else:
-                            caption = text[:MAX_CAPTION_LENGTH]
-                            await client.send_file(group.id, media['path'], caption=caption)
-                            remaining_text = text[MAX_CAPTION_LENGTH:]
-                            for chunk in self.split_text(remaining_text):
-                                await client.send_message(group.id, chunk)
+                        file = await client.upload_file(media['path'])
+                        entity = InputMediaUploadedPhoto(file=file)
+
+                        # Отправляем как фото с возможностью обрезанного текста
+                        caption = text[:MAX_CAPTION_LENGTH] if text else None
+                        await client.send_file(
+                            group.id,
+                            file=entity,
+                            caption=caption,
+                            parse_mode='html',
+                            force_document=False  # Важно: отправляем как фото
+                        )
+
                     elif media['type'] == 'video':
-                        if len(text) <= MAX_CAPTION_LENGTH:
-                            await client.send_file(group.id, media['path'], caption=text, supports_streaming=True)
-                        else:
-                            caption = text[:MAX_CAPTION_LENGTH]
-                            await client.send_file(group.id, media['path'], caption=caption, supports_streaming=True)
-                            remaining_text = text[MAX_CAPTION_LENGTH:]
-                            for chunk in self.split_text(remaining_text):
-                                await client.send_message(group.id, chunk)
-                else:
-                    if len(text) <= MAX_TEXT_LENGTH:
-                        await client.send_message(group.id, text)
-                    else:
-                        for chunk in self.split_text(text):
+                        file = await client.upload_file(media['path'])
+                        entity = InputMediaUploadedDocument(
+                            file=file,
+                            mime_type='video/mp4',
+                            attributes=[DocumentAttributeVideo(
+                                supports_streaming=True,
+                                duration=0,
+                                w=0,
+                                h=0
+                            )]
+                        )
+
+                        # Отправляем как видео с возможностью потоковой передачи
+                        caption = text[:MAX_CAPTION_LENGTH] if text else None
+                        await client.send_file(
+                            group.id,
+                            file=entity,
+                            caption=caption,
+                            supports_streaming=True,
+                            parse_mode='html',
+                            force_document=False  # Важно: отправляем как видео
+                        )
+
+                    # Отправляем оставшийся текст частями, если нужно
+                    if text and len(text) > MAX_CAPTION_LENGTH:
+                        remaining_text = text[MAX_CAPTION_LENGTH:]
+                        for chunk in self.split_text(remaining_text):
                             await client.send_message(group.id, chunk)
+
+                else:
+                    # Отправляем чистый текст
+                    for chunk in self.split_text(text):
+                        await client.send_message(group.id, chunk)
 
                 logger.info(f"Сообщение успешно отправлено в группу {group_name} (ID: {group.id})")
                 return True
