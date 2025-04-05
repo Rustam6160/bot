@@ -1337,9 +1337,9 @@ async def main():
     # Конфигурация для второго бота
     config2 = {
         'bot_name': 'Botru',
-        'api_id': 20541974,
-        'api_hash': '9c41bf75f6d30195032966367eff1f66',
-        'bot_token': '8188877991:AAHoRHbgoyl4wxvbnAXSJhEUo3jskzpDseY',
+        'api_id': 12914043,
+        'api_hash': '7bf1cb9eaedae46821cc23154646bc95',
+        'bot_token': '7586170122:AAEFbqflOCFhz_qxYmwfFaMaTtXgRP7_13Y',
         'proxy': proxy2,
         'db_file': 'mailing2.db',
         'owner_id': 7111113380
