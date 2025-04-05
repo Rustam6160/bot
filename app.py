@@ -956,7 +956,7 @@ class BotRunner:
             btn = Button.inline(f"{mark} {hour:02d}:{minute:02d}", f"select_hour_{hour}_{minute}")
 
             # Группируем по 4 кнопки в строку
-            if len(row) == 5:
+            if len(row) == 3:
                 buttons.append(row)
                 row = []
             row.append(btn)
