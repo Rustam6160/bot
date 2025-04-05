@@ -1339,18 +1339,18 @@ async def main():
         'bot_name': 'Botru',
         'api_id': 20541974,
         'api_hash': '9c41bf75f6d30195032966367eff1f66',
-        'bot_token': '7464740988:AAFBYMjyIGMAxfd3JQUYC95BM8NcXUfTwzU',
+        'bot_token': '8188877991:AAHoRHbgoyl4wxvbnAXSJhEUo3jskzpDseY',
         'proxy': proxy2,
         'db_file': 'mailing2.db',
         'owner_id': 7111113380
     }
 
     # Запускаем ботов параллельно
-    bot1 = BotRunner(config1)
+    # bot1 = BotRunner(config1)
     bot2 = BotRunner(config2)
 
     await asyncio.gather(
-        bot1.run(),
+        # bot1.run(),
         bot2.run()
     )
 
