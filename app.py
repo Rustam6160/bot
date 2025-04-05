@@ -1346,11 +1346,11 @@ async def main():
     }
 
     # Запускаем ботов параллельно
-    # bot1 = BotRunner(config1)
+    bot1 = BotRunner(config1)
     bot2 = BotRunner(config2)
 
     await asyncio.gather(
-        # bot1.run(),
+        bot1.run(),
         bot2.run()
     )
 
