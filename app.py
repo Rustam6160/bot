@@ -531,6 +531,8 @@ class BotRunner:
         return await aiosqlite.connect(self.config['db_file'])
 
     async def send_with_retry(self, client, group, text, media, max_attempts=3):
+        group_name = getattr(group, 'title', f'ID {group.id}')
+
         for attempt in range(max_attempts):
             try:
                 if media:
@@ -558,14 +560,16 @@ class BotRunner:
                     else:
                         for chunk in self.split_text(text):
                             await client.send_message(group.id, chunk)
-                logger.info(f"Сообщение успешно отправлено в группу {group.name} (ID: {group.id})")
+
+                logger.info(f"Сообщение успешно отправлено в группу {group_name} (ID: {group.id})")
                 return True
+
             except Exception as e:
-                logger.error(f"Ошибка при отправке в группу {group.name} (попытка {attempt + 1}): {e}")
+                logger.error(f"Ошибка при отправке в группу {group_name} (попытка {attempt + 1}): {e}")
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(5)
                 else:
-                    logger.error(f"Не удалось отправить сообщение в группу {group.name} после {max_attempts} попыток")
+                    logger.error(f"Не удалось отправить сообщение в группу {group_name} после {max_attempts} попыток")
                     return False
 
     async def is_owner_in_db(self):
@@ -736,13 +740,29 @@ class BotRunner:
                 f"👥 Группы: {groups}\n"
                 f"⏱ Интервал: {interval} мин\n"
                 f"⏰ Времена отправки: {times}\n"
-                f"📝 Сообщение: {message[:50]}..."
+                f"📝 Сообщение: {message}"  # Обрезаем сообщение
             )
 
-            if photo_path:
-                await event.client.send_file(event.chat_id, photo_path, caption=response)
-            else:
-                await event.respond(response)
+            try:
+                if photo_path:
+                    # Отправляем фото с обрезанной подписью
+                    await event.client.send_file(
+                        event.chat_id,
+                        photo_path,
+                        caption=response[:1024],  # Ограничение Telegram
+                        parse_mode='html'
+                    )
+                    # Отправляем остаток сообщения текстом
+                    if len(response) > 1024:
+                        await event.respond(response[1024:])
+                else:
+                    # Разбиваем длинное сообщение на части
+                    parts = [response[i:i + 4096] for i in range(0, len(response), 4096)]
+                    for part in parts:
+                        await event.respond(part)
+            except Exception as e:
+                logger.error(f"Ошибка отправки деталей рассылки: {str(e)}")
+                await event.respond("⚠️ Ошибка при отображении рассылки")
 
             await event.respond("Выберите действие:", buttons=[
                 [Button.inline("Удалить рассылку", f"delete_mailing_{mailing_id}")],
@@ -1317,8 +1337,8 @@ async def main():
     # Конфигурация для второго бота
     config2 = {
         'bot_name': 'Botru',
-        'api_id': 12914043,
-        'api_hash': '7bf1cb9eaedae46821cc23154646bc95',
+        'api_id': 20541974,
+        'api_hash': '9c41bf75f6d30195032966367eff1f66',
         'bot_token': '7464740988:AAFBYMjyIGMAxfd3JQUYC95BM8NcXUfTwzU',
         'proxy': proxy2,
         'db_file': 'mailing2.db',
